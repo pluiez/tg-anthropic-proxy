@@ -1,0 +1,19 @@
+[project]
+name = "tg-anthropic-proxy"
+version = "0.1.0"
+description = "Anthropic API proxy that tunnels requests through a Telegram bridge."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "python-telegram-bot[rate-limiter]>=21.0",
+  "httpx[http2]>=0.27",
+  "python-dotenv>=1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["shared", "client", "server"]
