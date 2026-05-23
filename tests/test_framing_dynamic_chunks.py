@@ -1,6 +1,7 @@
 from shared.framing import (
     MAX_TEXT_FRAME_CHARS,
     chunk_bytes,
+    chunk_bytes_for_frame_payloads,
     coerce_text_frame_chars,
     chunk_request_envelope,
     decode_request_blob,
@@ -78,3 +79,25 @@ def test_request_blob_rejects_corrupted_payload() -> None:
         assert "gzip" in str(exc) or "sha256" in str(exc)
     else:
         raise AssertionError("corrupted request blob should be rejected")
+
+
+def test_dynamic_payload_chunks_respect_nonzero_start_seq() -> None:
+    rid = "r_test123456"
+    data = (b"event: content_block_delta\n" + b"data: {\"text\":\"hello world\"}\n\n") * 500
+    start_seq = 42
+
+    chunks = chunk_bytes_for_frame_payloads(
+        data,
+        rid,
+        "resp_chunk",
+        max_chars=MAX_TEXT_FRAME_CHARS,
+        start_seq=start_seq,
+    )
+
+    assert b"".join(chunks) == data
+    assert len(chunks) < len(chunk_bytes(data))
+    assert all(
+        len(make_frame(rid, start_seq + offset, "resp_chunk", data=chunk))
+        <= MAX_TEXT_FRAME_CHARS
+        for offset, chunk in enumerate(chunks)
+    )

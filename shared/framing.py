@@ -92,6 +92,7 @@ def chunk_bytes_for_frame_payloads(
     *,
     max_chars: int = MAX_TEXT_FRAME_CHARS,
     extra: Optional[dict] = None,
+    start_seq: int = 0,
 ) -> list[bytes]:
     """Pack payload chunks using actual encoded frame length.
 
@@ -112,7 +113,7 @@ def chunk_bytes_for_frame_payloads(
         low = 1
         high = remaining
         best = 1
-        seq = len(chunks)
+        seq = start_seq + len(chunks)
         while low <= high:
             mid = (low + high) // 2
             candidate = data[offset:offset + mid]

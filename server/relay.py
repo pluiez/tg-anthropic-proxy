@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from collections import defaultdict
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from telegram import Update
@@ -17,8 +17,21 @@ from telegram.ext import (
 )
 
 from server.config import cc_proxy_base_url, configured_anthropic_base_url
+from shared.cache_protocol import (
+    DEFAULT_CACHE_MAX_BYTES,
+    DEFAULT_CACHE_MAX_ITEMS,
+    DEFAULT_CACHE_MIN_BYTES,
+    DEFAULT_CACHE_TTL_SECONDS,
+    body_json_bytes,
+    cache_candidates_for_body,
+    parse_cache_fields,
+    restore_body_from_cache_refs,
+)
+from shared.cache_store import TtlByteCache
 from shared.framing import (
-    chunk_bytes,
+    MAX_TEXT_FRAME_CHARS,
+    chunk_bytes_for_frame_payloads,
+    coerce_text_frame_chars,
     decode_request_blob,
     make_frame,
     parse_frame,
@@ -26,13 +39,15 @@ from shared.framing import (
 )
 from shared.logging_utils import redact_headers, summarize_json_body
 
-# Coalescer thresholds:
-#   - 1 second since last flush, OR
-#   - 3072 bytes accumulated (≈ 75% of Telegram's 4096-char text limit)
-# Either trigger flushes the buffer. Picked to minimise message rate so we
-# stay close to AIORateLimiter's group_max_rate of 3/sec.
-FLUSH_INTERVAL = 1.0
-FLUSH_BYTES = 3072
+# Response coalescer defaults. The first upstream chunk is flushed
+# immediately to satisfy clients waiting for first bytes; subsequent chunks are
+# coalesced to reduce Telegram sendMessage count and flood-limit exposure.
+DEFAULT_RESPONSE_FLUSH_INTERVAL = 2.0
+DEFAULT_RESPONSE_FLUSH_BYTES = 8192
+RESPONSE_FLUSH_INTERVAL = DEFAULT_RESPONSE_FLUSH_INTERVAL
+RESPONSE_FLUSH_BYTES = DEFAULT_RESPONSE_FLUSH_BYTES
+RESPONSE_FRAME_MAX_CHARS = MAX_TEXT_FRAME_CHARS
+CACHE_ACK_KEYS_PER_FRAME = 40
 
 log = logging.getLogger(__name__)
 
@@ -41,16 +56,47 @@ _http: Optional[httpx.AsyncClient] = None
 _bridge_chat_id: Optional[int] = None
 _anthropic_base: str = "https://api.anthropic.com"
 _use_cc_proxy = False
+_cache_enabled = True
+_cache_min_bytes = DEFAULT_CACHE_MIN_BYTES
+_cache_fields = parse_cache_fields(None)
+_cache: TtlByteCache | None = None
 
 
 class CcProxyUnavailable(RuntimeError):
     pass
 
 
+class RequestCacheMiss(RuntimeError):
+    def __init__(self, keys: list[str]) -> None:
+        self.keys = keys
+        super().__init__("cache miss: " + ",".join(keys))
+
+
 # Reassembly buffers for incoming request frames.
 _PARTS: dict[str, dict[int, bytes]] = defaultdict(dict)
 _TOTAL: dict[str, int] = {}
 _REQUEST_STARTED: dict[str, float] = {}
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 
 async def _ensure_cc_proxy_healthy(base_url: str) -> None:
@@ -84,6 +130,68 @@ async def _send(text: str) -> None:
         text=text,
         disable_notification=True,
     )
+
+
+def _cache_get(key: str) -> bytes | None:
+    if not _cache_enabled or _cache is None:
+        return None
+    return _cache.get(key)
+
+
+def _store_body_cache(rid: str, path: str, body_obj: Any) -> list[str]:
+    if not _cache_enabled or _cache is None or path != "/v1/messages":
+        return []
+    candidates = cache_candidates_for_body(
+        body_obj,
+        min_bytes=_cache_min_bytes,
+        fields=_cache_fields,
+    )
+    stored_keys = _cache.put_many((candidate.key, candidate.data) for candidate in candidates)
+    if candidates:
+        log.info(
+            "[%s] server cache candidates=%d newly_stored=%d cache_items=%d cache_bytes=%d fields=%s",
+            rid,
+            len(candidates),
+            len(stored_keys),
+            len(_cache),
+            _cache.total_bytes,
+            sorted(_cache_fields),
+        )
+    return stored_keys
+
+
+async def _send_cache_ack(rid: str, keys: list[str]) -> None:
+    if not keys:
+        return
+    for offset in range(0, len(keys), CACHE_ACK_KEYS_PER_FRAME):
+        batch = keys[offset:offset + CACHE_ACK_KEYS_PER_FRAME]
+        await _send(make_frame(rid, 0, "cache_ack", keys=batch))
+    log.info("[%s] server sent cache ack keys=%d", rid, len(keys))
+
+
+def _body_from_envelope(rid: str, envelope: dict[str, Any]) -> tuple[bytes, Any, list[str]] | None:
+    if "body_json" in envelope:
+        body_obj = envelope["body_json"]
+        restore = restore_body_from_cache_refs(body_obj, _cache_get)
+        if restore.missing_keys:
+            log.warning(
+                "[%s] server cache miss missing_keys=%s used_keys=%s",
+                rid,
+                restore.missing_keys,
+                restore.used_keys,
+            )
+            raise RequestCacheMiss(restore.missing_keys)
+        if restore.used_keys:
+            log.info("[%s] server restored cache refs used_keys=%d", rid, len(restore.used_keys))
+        return body_json_bytes(restore.body), restore.body, restore.used_keys
+
+    body_text = envelope.get("body", "")
+    body = str(body_text).encode("utf-8")
+    try:
+        body_obj = json.loads(body)
+    except Exception:
+        body_obj = None
+    return body, body_obj, []
 
 
 async def _on_req_document(msg) -> bool:
@@ -204,7 +312,19 @@ async def _process(rid: str, raw: bytes) -> None:
     headers = {**envelope.get("headers", {}), "accept-encoding": "identity"}
     if _use_cc_proxy:
         headers["x-tg-proxy-rid"] = rid
-    body = envelope.get("body", "").encode("utf-8")
+
+    try:
+        body_result = _body_from_envelope(rid, envelope)
+    except RequestCacheMiss as miss:
+        await _send(make_frame(rid, 0, "cache_miss", keys=miss.keys))
+        return
+    except Exception as exc:
+        log.warning("[%s] server failed to decode cached envelope error=%s", rid, exc)
+        await _send(make_frame(rid, 0, "resp_error", error=f"bad cached envelope: {exc}"))
+        return
+
+    body, body_obj, _used_cache_keys = body_result
+    cache_ack_keys = _store_body_cache(rid, path, body_obj)
     log.info(
         "[%s] server forwarding request upstream=%s use_cc_proxy=%s body=%s headers=%s",
         rid,
@@ -217,28 +337,57 @@ async def _process(rid: str, raw: bytes) -> None:
     seq = 0
     buf = bytearray()
     last_flush = time.monotonic()
+    first_response_flush_done = False
     upstream_bytes = 0
     telegram_chunks = 0
 
-    async def flush() -> None:
+    async def flush(reason: str) -> None:
         nonlocal seq, last_flush, telegram_chunks
         if not buf:
             return
         data = bytes(buf)
         buf.clear()
-        last_flush = time.monotonic()
-        chunks = chunk_bytes(data)
-        log.debug(
-            "[%s] server flushing response bytes=%d telegram_chunks=%d next_seq=%d",
+        chunks = chunk_bytes_for_frame_payloads(
+            data,
             rid,
+            "resp_chunk",
+            max_chars=RESPONSE_FRAME_MAX_CHARS,
+            start_seq=seq,
+        )
+        log.info(
+            "[%s] server flushing response reason=%s bytes=%d telegram_frames=%d next_seq=%d frame_max_chars=%d",
+            rid,
+            reason,
             len(data),
             len(chunks),
             seq,
+            RESPONSE_FRAME_MAX_CHARS,
         )
         for chunk in chunks:
-            await _send(make_frame(rid, seq, "resp_chunk", data=chunk))
+            frame = make_frame(rid, seq, "resp_chunk", data=chunk)
+            frame_chars = len(frame)
+            send_started = time.monotonic()
+            log.info(
+                "[%s] server sending response frame reason=%s seq=%d bytes=%d frame_chars=%d",
+                rid,
+                reason,
+                seq,
+                len(chunk),
+                frame_chars,
+            )
+            await _send(frame)
+            log.info(
+                "[%s] server sent response frame reason=%s seq=%d bytes=%d frame_chars=%d elapsed=%.3fs",
+                rid,
+                reason,
+                seq,
+                len(chunk),
+                frame_chars,
+                time.monotonic() - send_started,
+            )
             telegram_chunks += 1
             seq += 1
+        last_flush = time.monotonic()
 
     try:
         assert _http is not None
@@ -265,25 +414,40 @@ async def _process(rid: str, raw: bytes) -> None:
                 upstream_bytes += len(piece)
                 buf.extend(piece)
                 log.debug("[%s] server upstream chunk bytes=%d buffered=%d", rid, len(piece), len(buf))
-                if (
-                    len(buf) >= FLUSH_BYTES
-                    or (time.monotonic() - last_flush) >= FLUSH_INTERVAL
+                if not first_response_flush_done:
+                    await flush("first_chunk")
+                    first_response_flush_done = True
+                elif (
+                    len(buf) >= RESPONSE_FLUSH_BYTES
+                    or (time.monotonic() - last_flush) >= RESPONSE_FLUSH_INTERVAL
                 ):
-                    await flush()
-            await flush()
+                    await flush("interval_or_size")
+            await flush("eof")
     except Exception as e:
         log.exception("[%s] server relay error upstream=%s", rid, url)
         await _send(make_frame(rid, seq, "resp_error", error=str(e)))
         return
 
-    await _send(make_frame(rid, seq, "resp_end"))
+    end_frame = make_frame(rid, seq, "resp_end")
+    end_started = time.monotonic()
+    await _send(end_frame)
     log.info(
-        "[%s] server completed response upstream_bytes=%d telegram_chunks=%d end_seq=%d elapsed=%.3fs",
+        "[%s] server sent response end seq=%d frame_chars=%d elapsed=%.3fs",
+        rid,
+        seq,
+        len(end_frame),
+        time.monotonic() - end_started,
+    )
+    if cache_ack_keys:
+        asyncio.create_task(_send_cache_ack(rid, cache_ack_keys))
+    log.info(
+        "[%s] server completed response upstream_bytes=%d telegram_chunks=%d end_seq=%d elapsed=%.3fs cache_ack_keys=%d",
         rid,
         upstream_bytes,
         telegram_chunks,
         seq,
         time.monotonic() - started,
+        len(cache_ack_keys),
     )
 
 
@@ -305,6 +469,8 @@ async def _handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def serve(*, use_cc_proxy: bool = False) -> None:
     global _app, _http, _bridge_chat_id, _anthropic_base, _use_cc_proxy
+    global _cache_enabled, _cache_min_bytes, _cache_fields, _cache
+    global RESPONSE_FLUSH_INTERVAL, RESPONSE_FLUSH_BYTES, RESPONSE_FRAME_MAX_CHARS
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -316,6 +482,25 @@ async def serve(*, use_cc_proxy: bool = False) -> None:
         await _ensure_cc_proxy_healthy(_anthropic_base)
     else:
         _anthropic_base = configured_anthropic_base_url()
+
+    RESPONSE_FLUSH_INTERVAL = max(0.1, _float_env("PROXY_RESPONSE_FLUSH_INTERVAL", DEFAULT_RESPONSE_FLUSH_INTERVAL))
+    RESPONSE_FLUSH_BYTES = max(1, _int_env("PROXY_RESPONSE_FLUSH_BYTES", DEFAULT_RESPONSE_FLUSH_BYTES))
+    RESPONSE_FRAME_MAX_CHARS = coerce_text_frame_chars(
+        os.getenv("PROXY_TELEGRAM_RESPONSE_FRAME_MAX_CHARS") or os.getenv("PROXY_TELEGRAM_FRAME_MAX_CHARS"),
+        default=MAX_TEXT_FRAME_CHARS,
+    )
+
+    _cache_enabled = _bool_env("PROXY_TELEGRAM_CACHE_ENABLED", True)
+    _cache_min_bytes = _int_env("PROXY_TELEGRAM_CACHE_MIN_BYTES", DEFAULT_CACHE_MIN_BYTES)
+    _cache_fields = parse_cache_fields(os.getenv("PROXY_TELEGRAM_CACHE_FIELDS"))
+    if _cache_enabled:
+        _cache = TtlByteCache(
+            ttl_seconds=_int_env("PROXY_TELEGRAM_CACHE_TTL_SECONDS", DEFAULT_CACHE_TTL_SECONDS),
+            max_items=_int_env("PROXY_TELEGRAM_CACHE_MAX_ITEMS", DEFAULT_CACHE_MAX_ITEMS),
+            max_bytes=_int_env("PROXY_TELEGRAM_CACHE_MAX_BYTES", DEFAULT_CACHE_MAX_BYTES),
+        )
+    else:
+        _cache = None
 
     _bridge_chat_id = int(os.environ["BRIDGE_CHAT_ID"])
     token = os.environ["BOT_B_TOKEN"]
@@ -349,10 +534,16 @@ async def serve(*, use_cc_proxy: bool = False) -> None:
     )
 
     log.info(
-        "Server up on bridge chat %s, upstream %s, use_cc_proxy=%s",
+        "Server up on bridge chat %s, upstream %s, use_cc_proxy=%s cache_enabled=%s cache_fields=%s cache_min_bytes=%d response_flush_interval=%.3f response_flush_bytes=%d response_frame_max_chars=%d",
         _bridge_chat_id,
         _anthropic_base,
         _use_cc_proxy,
+        _cache_enabled,
+        sorted(_cache_fields),
+        _cache_min_bytes,
+        RESPONSE_FLUSH_INTERVAL,
+        RESPONSE_FLUSH_BYTES,
+        RESPONSE_FRAME_MAX_CHARS,
     )
     try:
         await asyncio.Event().wait()
