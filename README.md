@@ -15,7 +15,7 @@ Request flow:
 1. Claude Code sends an Anthropic API request to the client URL, for example `http://127.0.0.1:8787/v1/messages`.
 2. `client` accepts the HTTP request, normalizes the Anthropic path, keeps only relay-safe headers, and wraps `path`, `headers`, and request body into an internal envelope.
 3. `client` sends that envelope to the shared Telegram chat with bot A (`BOT_A_TOKEN`). Small requests use text frames. Large requests may use one compressed Telegram document fallback. Repeated Claude Code payload sections can be replaced with internal cache references before sending.
-4. `server` listens to the same Telegram chat with bot B (`BOT_B_TOKEN`). It receives text frames or request documents, reconstructs the internal envelope, restores any cache references from its in-memory cache, and rebuilds the full Anthropic request body.
+4. `server` listens to the same Telegram chat with bot B (`BOT_B_TOKEN`). It receives text frames or request documents, reconstructs the internal envelope, restores any cache references from its local SQLite cache DB, and rebuilds the full Anthropic request body.
 5. `server` forwards the reconstructed request to the configured upstream:
    - without `--use-cc-proxy`: directly to `.env` `ANTHROPIC_BASE_URL`;
    - with `--use-cc-proxy`: to the local `cc_proxy` endpoint defined by `CC_PROXY_HOST` / `CC_PROXY_PORT`.
@@ -53,8 +53,13 @@ Request-side optimizations:
 
 - Dynamic text-frame packing validates the actual encoded Telegram message length instead of using only a fixed raw byte size.
 - Large request envelopes can use a compressed Telegram document fallback to avoid many text messages and Telegram flood limits.
-- Protocol-level cache references let repeated Claude Code `tools`, `system`, and `messages` prefixes cross the bridge as small sha256 refs after the server has cached them.
-- The cache is in-memory and has a default TTL of 72 hours. If the server cache misses, the client automatically resends the full request envelope.
+- Protocol-level cache references let repeated Claude Code `tools`, `system`, and `messages` prefixes cross the bridge as small 64-hex sha256 refs when the client local SQLite DB already has the canonical JSON bytes.
+- Both client and server keep local SQLite cache DBs with a default TTL of 72 hours. The protocol no longer sends `cache_ack`; if the server DB misses a ref, the client can replay the same request envelope in full up to `PROXY_CACHE_CLIENT_HIT_SERVER_MISS_MAX_REPLAYS` times per process.
+
+Known Claude Code cache invalidators:
+
+- Claude Code can prepend a short `system` block like `x-anthropic-billing-header: ...; cch=...;`. The `cch` value has been observed changing between otherwise identical requests. Because the bridge hashes the complete canonical `system` JSON value, this makes the local `system` cache key unstable. Since Anthropic prompt caching is prefix-based in `tools -> system -> messages` order, the changing first `system` block can also prevent later `system` or `messages` prompt-cache breakpoints from matching upstream.
+- With Claude Code `2.1.140` and `figma@claude-plugins-official` `2.2.12`, the Figma plugin skill list in the injected `messages[0].content[0]` `<system-reminder>` has been observed with nondeterministic ordering. The same eight `figma:*` skills stay in one contiguous region, but their internal order changes between requests, making the complete canonical `messages` JSON value hash differently. Disabling or uninstalling the Figma plugin removes this source of `messages` cache misses.
 
 Response-side optimizations:
 

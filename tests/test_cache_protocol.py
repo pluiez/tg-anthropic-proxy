@@ -2,6 +2,7 @@ from shared.cache_protocol import (
     CACHE_REF_KEY,
     MESSAGES_CACHE_KEY,
     cache_candidates_for_body,
+    cache_key_for_json,
     compress_body_with_cache_refs,
     parse_cache_fields,
     restore_body_from_cache_refs,
@@ -22,6 +23,14 @@ def _body() -> dict:
             {"role": "user", "content": "third"},
         ],
     }
+
+
+def test_cache_key_is_bare_64_hex_digest() -> None:
+    key = cache_key_for_json({"b": 1, "a": [2, 3]})
+
+    assert len(key) == 64
+    assert not key.startswith("sha256:")
+    int(key, 16)
 
 
 def test_cache_candidates_include_tools_system_and_message_prefixes() -> None:

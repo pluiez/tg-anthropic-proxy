@@ -16,10 +16,13 @@ from fastapi.responses import StreamingResponse  # noqa: E402
 
 from client import tg_client  # noqa: E402
 from client.routing import anthropic_v1_path  # noqa: E402
+from shared.cache_db import SqliteByteCache, now_epoch_ms  # noqa: E402
 from shared.cache_protocol import (  # noqa: E402
+    DEFAULT_CACHE_MAX_BYTES,
     DEFAULT_CACHE_MAX_ITEMS,
     DEFAULT_CACHE_MIN_BYTES,
     DEFAULT_CACHE_TTL_SECONDS,
+    cache_candidates_for_body,
     compress_body_with_cache_refs,
     parse_cache_fields,
 )
@@ -73,8 +76,17 @@ CACHE_ENABLED = _bool_env("PROXY_TELEGRAM_CACHE_ENABLED", True)
 CACHE_TTL_SECONDS = _int_env("PROXY_TELEGRAM_CACHE_TTL_SECONDS", DEFAULT_CACHE_TTL_SECONDS)
 CACHE_MIN_BYTES = _int_env("PROXY_TELEGRAM_CACHE_MIN_BYTES", DEFAULT_CACHE_MIN_BYTES)
 CACHE_FIELDS = parse_cache_fields(os.getenv("PROXY_TELEGRAM_CACHE_FIELDS"))
-CACHE_KNOWN_MAX_ITEMS = _int_env("PROXY_TELEGRAM_CACHE_KNOWN_MAX_ITEMS", DEFAULT_CACHE_MAX_ITEMS * 4)
-_KNOWN_CACHE_KEYS: dict[str, float] = {}
+CACHE_MAX_ITEMS = _int_env("PROXY_TELEGRAM_CACHE_MAX_ITEMS", DEFAULT_CACHE_MAX_ITEMS)
+CACHE_MAX_BYTES = _int_env("PROXY_TELEGRAM_CACHE_MAX_BYTES", DEFAULT_CACHE_MAX_BYTES)
+CACHE_DB_PATH = os.getenv("PROXY_CLIENT_CACHE_DB_PATH", ".cache/client-cache.sqlite3")
+CACHE_CLIENT_HIT_SERVER_MISS_MAX_REPLAYS = _int_env("PROXY_CACHE_CLIENT_HIT_SERVER_MISS_MAX_REPLAYS", 10)
+CACHE_INCONSISTENCY_MESSAGE = (
+    "client/server cache inconsistency detected: client cache refs missed on server too many times. "
+    "Increase PROXY_CACHE_CLIENT_HIT_SERVER_MISS_MAX_REPLAYS if the server cache was intentionally reset, "
+    "or clear the client cache DB."
+)
+_CACHE_DB: SqliteByteCache | None = None
+_CACHE_MISS_REPLAY_COUNT = 0
 
 
 class CacheMiss(RuntimeError):
@@ -89,47 +101,39 @@ def _client_addr(request: Request) -> str:
     return f"{request.client.host}:{request.client.port}"
 
 
-def _cache_now() -> float:
-    return time.monotonic()
+def _cache_store() -> SqliteByteCache | None:
+    global _CACHE_DB
+    if not CACHE_ENABLED:
+        return None
+    if _CACHE_DB is None:
+        _CACHE_DB = SqliteByteCache(
+            CACHE_DB_PATH,
+            ttl_seconds=CACHE_TTL_SECONDS,
+            max_items=CACHE_MAX_ITEMS,
+            max_bytes=CACHE_MAX_BYTES,
+        )
+    return _CACHE_DB
 
 
-def _prune_known_cache_keys() -> None:
-    now = _cache_now()
-    expired = [key for key, expires_at in _KNOWN_CACHE_KEYS.items() if expires_at <= now]
-    for key in expired:
-        _KNOWN_CACHE_KEYS.pop(key, None)
-    while len(_KNOWN_CACHE_KEYS) > CACHE_KNOWN_MAX_ITEMS:
-        oldest = min(_KNOWN_CACHE_KEYS, key=_KNOWN_CACHE_KEYS.get)
-        _KNOWN_CACHE_KEYS.pop(oldest, None)
+def _consume_cache_miss_replay_slot() -> tuple[bool, int, int]:
+    global _CACHE_MISS_REPLAY_COUNT
+    limit = max(0, int(CACHE_CLIENT_HIT_SERVER_MISS_MAX_REPLAYS))
+    _CACHE_MISS_REPLAY_COUNT += 1
+    return _CACHE_MISS_REPLAY_COUNT <= limit, _CACHE_MISS_REPLAY_COUNT, limit
 
 
-def _known_cache_keys() -> frozenset[str]:
-    _prune_known_cache_keys()
-    return frozenset(_KNOWN_CACHE_KEYS)
-
-
-def _remember_cache_keys(keys: list[str]) -> None:
-    if not CACHE_ENABLED or not keys:
-        return
-    expires_at = _cache_now() + max(1, CACHE_TTL_SECONDS)
-    for key in keys:
-        if isinstance(key, str) and key:
-            _KNOWN_CACHE_KEYS[key] = expires_at
-    _prune_known_cache_keys()
-    log.info("client remembered cache keys count=%d known_keys=%d", len(keys), len(_KNOWN_CACHE_KEYS))
-
-
-def _forget_cache_keys(keys: list[str]) -> None:
-    for key in keys:
-        _KNOWN_CACHE_KEYS.pop(key, None)
-    if keys:
-        log.info("client forgot cache-missed keys count=%d known_keys=%d", len(keys), len(_KNOWN_CACHE_KEYS))
-
-
-def _make_envelope(upstream_path: str, headers: dict[str, str], *, body: str | None = None, body_json: Any = None) -> bytes:
+def _make_envelope(
+    upstream_path: str,
+    headers: dict[str, str],
+    *,
+    cache_ts: int,
+    body: str | None = None,
+    body_json: Any = None,
+) -> bytes:
     envelope: dict[str, Any] = {
         "path": upstream_path,
         "headers": headers,
+        "cache_ts": int(cache_ts),
     }
     if body_json is not None:
         envelope["body_json"] = body_json
@@ -143,12 +147,16 @@ def _build_request_envelopes(
     headers: dict[str, str],
     body: bytes,
 ) -> tuple[bytes, bytes, dict[str, Any]]:
+    cache_ts = now_epoch_ms()
     body_text = body.decode("utf-8")
-    full_envelope = _make_envelope(upstream_path, headers, body=body_text)
+    full_envelope = _make_envelope(upstream_path, headers, cache_ts=cache_ts, body=body_text)
     stats: dict[str, Any] = {
         "cache_enabled": CACHE_ENABLED,
         "cache_fields": sorted(CACHE_FIELDS),
+        "cache_ts": cache_ts,
         "cache_candidates": 0,
+        "cache_db_hits": 0,
+        "cache_db_new_entries": 0,
         "cache_refs": 0,
         "messages_prefix_len": 0,
         "optimized_bytes": None,
@@ -162,9 +170,32 @@ def _build_request_envelopes(
     except json.JSONDecodeError:
         return full_envelope, full_envelope, stats
 
+    candidates = cache_candidates_for_body(
+        body_obj,
+        min_bytes=CACHE_MIN_BYTES,
+        fields=CACHE_FIELDS,
+    )
+    stats["cache_candidates"] = len(candidates)
+    if not candidates:
+        return full_envelope, full_envelope, stats
+
+    cache = _cache_store()
+    if cache is None:
+        return full_envelope, full_envelope, stats
+
+    candidate_keys = [candidate.key for candidate in candidates]
+    local_keys = cache.contains_many(candidate_keys)
+    stats["cache_db_hits"] = len(local_keys)
+
+    stored_keys = cache.put_many(
+        ((candidate.key, candidate.data) for candidate in candidates),
+        cache_ts=cache_ts,
+    )
+    stats["cache_db_new_entries"] = len(stored_keys)
+
     result = compress_body_with_cache_refs(
         body_obj,
-        _known_cache_keys(),
+        local_keys,
         min_bytes=CACHE_MIN_BYTES,
         fields=CACHE_FIELDS,
     )
@@ -173,7 +204,6 @@ def _build_request_envelopes(
 
     stats.update(
         {
-            "cache_candidates": len(result.candidates),
             "cache_refs": len(result.ref_keys),
             "messages_prefix_len": result.messages_prefix_len,
         }
@@ -181,7 +211,7 @@ def _build_request_envelopes(
     if not result.ref_keys:
         return full_envelope, full_envelope, stats
 
-    optimized_envelope = _make_envelope(upstream_path, headers, body_json=result.body)
+    optimized_envelope = _make_envelope(upstream_path, headers, cache_ts=cache_ts, body_json=result.body)
     stats["optimized_bytes"] = len(optimized_envelope)
     if len(optimized_envelope) >= len(full_envelope):
         stats["cache_refs"] = 0
@@ -233,8 +263,7 @@ async def _on_frame(frame: dict[str, Any]) -> None:
     kind = frame["kind"]
     if kind == "cache_ack":
         keys = [key for key in frame.get("keys", []) if isinstance(key, str)]
-        log.info("[%s] client received cache ack keys=%d", rid, len(keys))
-        _remember_cache_keys(keys)
+        log.info("[%s] client received legacy cache ack keys=%d ignored=true", rid, len(keys))
         return
 
     q = PENDING.get(rid)
@@ -245,7 +274,6 @@ async def _on_frame(frame: dict[str, Any]) -> None:
     if kind == "cache_miss":
         keys = [key for key in frame.get("keys", []) if isinstance(key, str)]
         log.warning("[%s] client received cache miss keys=%d", rid, len(keys))
-        _forget_cache_keys(keys)
         q.put_nowait(CacheMiss(keys))
     elif kind == "resp_chunk":
         payload = frame["payload"]
@@ -269,11 +297,13 @@ async def lifespan(app: FastAPI):
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     log.info(
-        "client starting bridge listener cache_enabled=%s cache_fields=%s cache_ttl_seconds=%d cache_min_bytes=%d",
+        "client starting bridge listener cache_enabled=%s cache_fields=%s cache_ttl_seconds=%d cache_min_bytes=%d cache_db_path=%s cache_miss_replay_limit=%d",
         CACHE_ENABLED,
         sorted(CACHE_FIELDS),
         CACHE_TTL_SECONDS,
         CACHE_MIN_BYTES,
+        CACHE_DB_PATH,
+        CACHE_CLIENT_HIT_SERVER_MISS_MAX_REPLAYS,
     )
     await tg_client.start(_on_frame)
     log.info("client bridge listener ready")
@@ -355,10 +385,23 @@ async def proxy(path: str, request: Request):
                     yield f"event: error\ndata: {json.dumps(err)}\n\n".encode("utf-8")
                     return
                 if isinstance(item, CacheMiss):
+                    elapsed = time.monotonic() - started
                     if replayed_full_after_cache_miss:
-                        elapsed = time.monotonic() - started
-                        log.warning("[%s] client repeated cache miss keys=%s elapsed=%.3fs", rid, item.keys, elapsed)
-                        err = {"type": "proxy_error", "message": "cache miss after full replay"}
+                        log.warning("[%s] client repeated cache miss after full replay keys=%s elapsed=%.3fs", rid, item.keys, elapsed)
+                        err = {"type": "proxy_error", "message": CACHE_INCONSISTENCY_MESSAGE}
+                        yield f"event: error\ndata: {json.dumps(err)}\n\n".encode("utf-8")
+                        return
+                    allowed, replay_count, replay_limit = _consume_cache_miss_replay_slot()
+                    log.warning(
+                        "[%s] client cache hit but server cache miss keys=%s replay_count=%d replay_limit=%d elapsed=%.3fs",
+                        rid,
+                        item.keys,
+                        replay_count,
+                        replay_limit,
+                        elapsed,
+                    )
+                    if not allowed:
+                        err = {"type": "proxy_error", "message": CACHE_INCONSISTENCY_MESSAGE}
                         yield f"event: error\ndata: {json.dumps(err)}\n\n".encode("utf-8")
                         return
                     replayed_full_after_cache_miss = True

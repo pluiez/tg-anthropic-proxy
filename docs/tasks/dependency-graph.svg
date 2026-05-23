@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 620" width="980" height="620" role="img" aria-labelledby="title desc">
+  <title id="title">docs/tasks dependency graph</title>
+  <desc id="desc">Dependency visualization for tasks 001 through 005.</desc>
+  <defs>
+    <style>
+      .bg{fill:#f7f8fb}.card{fill:#fff;stroke:#ccd5e4;stroke-width:1.4}.future{fill:#fbfcff;stroke:#ccd5e4;stroke-width:1.4;stroke-dasharray:7 5}.badge{fill:#284366}.id{fill:#fff;font:700 13px system-ui}.title{fill:#172033;font:700 16px system-ui}.desc{fill:#647084;font:13px system-ui}.soft{fill:none;stroke:#6b7fdb;stroke-width:2.6;stroke-dasharray:8 7;marker-end:url(#softArrow)}.hard{fill:none;stroke:#d15a47;stroke-width:2.8;marker-end:url(#hardArrow)}.label{font:700 13px system-ui;paint-order:stroke;stroke:#fff;stroke-width:5px;stroke-linejoin:round}.softText{fill:#6b7fdb}.hardText{fill:#d15a47}.note{fill:#fff8e8;stroke:#efcc7a}
+    </style>
+    <marker id="softArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#6b7fdb"/>
+    </marker>
+    <marker id="hardArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#d15a47"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="980" height="620"/>
+  <text x="40" y="48" class="title" style="font-size:28px">docs/tasks 任务依赖图</text>
+  <text x="40" y="78" class="desc">红色实线是强前置；蓝色虚线是推荐顺序。005 是未来任务，前置条件最重。</text>
+
+  <path class="soft" d="M260 168 C320 168 340 168 400 168"/>
+  <text class="label softText" x="300" y="154">推荐先后</text>
+  <path class="soft" d="M580 168 C640 168 660 168 720 168"/>
+  <text class="label softText" x="620" y="154">推荐先后</text>
+  <path class="soft" d="M170 278 C170 318 170 344 170 386"/>
+  <text class="label softText" x="184" y="334">推荐批次</text>
+  <path class="hard" d="M260 472 C370 472 440 508 472 544"/>
+  <text class="label hardText" x="354" y="494">强前置</text>
+  <path class="hard" d="M580 168 C680 230 650 430 558 544"/>
+  <text class="label hardText" x="660" y="326">强前置</text>
+  <path class="hard" d="M260 472 C400 450 610 472 610 544"/>
+  <text class="label hardText" x="503" y="458">强前置</text>
+
+  <g transform="translate(40 100)">
+    <rect class="card" width="220" height="168" rx="8"/>
+    <rect class="badge" x="16" y="16" width="46" height="28" rx="6"/>
+    <text class="id" x="39" y="35" text-anchor="middle">001</text>
+    <text class="title" x="16" y="70">DB cache</text>
+    <text class="title" x="16" y="92">remove cache_ack</text>
+    <text class="desc" x="16" y="124">协议基础层 / 缓存持久化</text>
+    <text class="desc" x="16" y="148">降低 bot_b 消息数</text>
+  </g>
+  <g transform="translate(400 100)">
+    <rect class="card" width="180" height="168" rx="8"/>
+    <rect class="badge" x="16" y="16" width="46" height="28" rx="6"/>
+    <text class="id" x="39" y="35" text-anchor="middle">002</text>
+    <text class="title" x="16" y="70">Response EOF</text>
+    <text class="title" x="16" y="92">frame merge</text>
+    <text class="desc" x="16" y="124">resp_chunk eof=true</text>
+    <text class="desc" x="16" y="148">兼容 resp_end</text>
+  </g>
+  <g transform="translate(720 100)">
+    <rect class="card" width="220" height="168" rx="8"/>
+    <rect class="badge" x="16" y="16" width="46" height="28" rx="6"/>
+    <text class="id" x="39" y="35" text-anchor="middle">003</text>
+    <text class="title" x="16" y="70">Request text EOF</text>
+    <text class="title" x="16" y="92">frame merge</text>
+    <text class="desc" x="16" y="124">req eof=true</text>
+    <text class="desc" x="16" y="148">兼容 req_end</text>
+  </g>
+  <g transform="translate(40 386)">
+    <rect class="card" width="220" height="168" rx="8"/>
+    <rect class="badge" x="16" y="16" width="46" height="28" rx="6"/>
+    <text class="id" x="39" y="35" text-anchor="middle">004</text>
+    <text class="title" x="16" y="70">Document timeout</text>
+    <text class="title" x="16" y="92">orphan cancel</text>
+    <text class="desc" x="16" y="124">sendDocument timeout</text>
+    <text class="desc" x="16" y="148">cancel frame / cleanup</text>
+  </g>
+  <g transform="translate(410 544)">
+    <rect class="future" width="260" height="58" rx="8"/>
+    <text class="title" x="16" y="25">005 Future response document</text>
+    <text class="desc" x="16" y="46">大 response 才考虑 hybrid fallback</text>
+  </g>
+  <g transform="translate(332 314)">
+    <rect class="note" width="315" height="104" rx="8"/>
+    <text class="title" x="18" y="32">可并行分析，落代码需协调</text>
+    <text class="desc" x="18" y="60">002/003 都会触碰 framing/client/server</text>
+    <text class="desc" x="18" y="82">001/004 独立，但共享 env/README/tests</text>
+  </g>
+</svg>

@@ -54,7 +54,7 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 
 def cache_key_for_bytes(data: bytes) -> str:
-    return "sha256:" + hashlib.sha256(data).hexdigest()
+    return hashlib.sha256(data).hexdigest()
 
 
 def cache_key_for_json(value: Any) -> str:

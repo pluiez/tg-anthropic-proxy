@@ -27,7 +27,7 @@ from shared.cache_protocol import (
     parse_cache_fields,
     restore_body_from_cache_refs,
 )
-from shared.cache_store import TtlByteCache
+from shared.cache_db import SqliteByteCache, now_epoch_ms
 from shared.framing import (
     MAX_TEXT_FRAME_CHARS,
     chunk_bytes_for_frame_payloads,
@@ -47,7 +47,6 @@ DEFAULT_RESPONSE_FLUSH_BYTES = 8192
 RESPONSE_FLUSH_INTERVAL = DEFAULT_RESPONSE_FLUSH_INTERVAL
 RESPONSE_FLUSH_BYTES = DEFAULT_RESPONSE_FLUSH_BYTES
 RESPONSE_FRAME_MAX_CHARS = MAX_TEXT_FRAME_CHARS
-CACHE_ACK_KEYS_PER_FRAME = 40
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +58,7 @@ _use_cc_proxy = False
 _cache_enabled = True
 _cache_min_bytes = DEFAULT_CACHE_MIN_BYTES
 _cache_fields = parse_cache_fields(None)
-_cache: TtlByteCache | None = None
+_cache: SqliteByteCache | None = None
 
 
 class CcProxyUnavailable(RuntimeError):
@@ -138,7 +137,19 @@ def _cache_get(key: str) -> bytes | None:
     return _cache.get(key)
 
 
-def _store_body_cache(rid: str, path: str, body_obj: Any) -> list[str]:
+def _cache_ts_from_envelope(envelope: dict[str, Any]) -> int:
+    raw = envelope.get("cache_ts")
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return now_epoch_ms()
+
+
+def _store_body_cache(rid: str, path: str, body_obj: Any, *, cache_ts: int) -> list[str]:
     if not _cache_enabled or _cache is None or path != "/v1/messages":
         return []
     candidates = cache_candidates_for_body(
@@ -146,7 +157,10 @@ def _store_body_cache(rid: str, path: str, body_obj: Any) -> list[str]:
         min_bytes=_cache_min_bytes,
         fields=_cache_fields,
     )
-    stored_keys = _cache.put_many((candidate.key, candidate.data) for candidate in candidates)
+    stored_keys = _cache.put_many(
+        ((candidate.key, candidate.data) for candidate in candidates),
+        cache_ts=cache_ts,
+    )
     if candidates:
         log.info(
             "[%s] server cache candidates=%d newly_stored=%d cache_items=%d cache_bytes=%d fields=%s",
@@ -160,16 +174,8 @@ def _store_body_cache(rid: str, path: str, body_obj: Any) -> list[str]:
     return stored_keys
 
 
-async def _send_cache_ack(rid: str, keys: list[str]) -> None:
-    if not keys:
-        return
-    for offset in range(0, len(keys), CACHE_ACK_KEYS_PER_FRAME):
-        batch = keys[offset:offset + CACHE_ACK_KEYS_PER_FRAME]
-        await _send(make_frame(rid, 0, "cache_ack", keys=batch))
-    log.info("[%s] server sent cache ack keys=%d", rid, len(keys))
-
-
-def _body_from_envelope(rid: str, envelope: dict[str, Any]) -> tuple[bytes, Any, list[str]] | None:
+def _body_from_envelope(rid: str, envelope: dict[str, Any]) -> tuple[bytes, Any, list[str], int] | None:
+    cache_ts = _cache_ts_from_envelope(envelope)
     if "body_json" in envelope:
         body_obj = envelope["body_json"]
         restore = restore_body_from_cache_refs(body_obj, _cache_get)
@@ -182,8 +188,10 @@ def _body_from_envelope(rid: str, envelope: dict[str, Any]) -> tuple[bytes, Any,
             )
             raise RequestCacheMiss(restore.missing_keys)
         if restore.used_keys:
+            if _cache is not None:
+                _cache.touch_many(restore.used_keys, cache_ts=cache_ts)
             log.info("[%s] server restored cache refs used_keys=%d", rid, len(restore.used_keys))
-        return body_json_bytes(restore.body), restore.body, restore.used_keys
+        return body_json_bytes(restore.body), restore.body, restore.used_keys, cache_ts
 
     body_text = envelope.get("body", "")
     body = str(body_text).encode("utf-8")
@@ -191,7 +199,7 @@ def _body_from_envelope(rid: str, envelope: dict[str, Any]) -> tuple[bytes, Any,
         body_obj = json.loads(body)
     except Exception:
         body_obj = None
-    return body, body_obj, []
+    return body, body_obj, [], cache_ts
 
 
 async def _on_req_document(msg) -> bool:
@@ -323,8 +331,8 @@ async def _process(rid: str, raw: bytes) -> None:
         await _send(make_frame(rid, 0, "resp_error", error=f"bad cached envelope: {exc}"))
         return
 
-    body, body_obj, _used_cache_keys = body_result
-    cache_ack_keys = _store_body_cache(rid, path, body_obj)
+    body, body_obj, _used_cache_keys, cache_ts = body_result
+    stored_cache_keys = _store_body_cache(rid, path, body_obj, cache_ts=cache_ts)
     log.info(
         "[%s] server forwarding request upstream=%s use_cc_proxy=%s body=%s headers=%s",
         rid,
@@ -438,16 +446,15 @@ async def _process(rid: str, raw: bytes) -> None:
         len(end_frame),
         time.monotonic() - end_started,
     )
-    if cache_ack_keys:
-        asyncio.create_task(_send_cache_ack(rid, cache_ack_keys))
     log.info(
-        "[%s] server completed response upstream_bytes=%d telegram_chunks=%d end_seq=%d elapsed=%.3fs cache_ack_keys=%d",
+        "[%s] server completed response upstream_bytes=%d telegram_chunks=%d end_seq=%d elapsed=%.3fs stored_cache_keys=%d used_cache_keys=%d",
         rid,
         upstream_bytes,
         telegram_chunks,
         seq,
         time.monotonic() - started,
-        len(cache_ack_keys),
+        len(stored_cache_keys),
+        len(_used_cache_keys),
     )
 
 
@@ -494,7 +501,8 @@ async def serve(*, use_cc_proxy: bool = False) -> None:
     _cache_min_bytes = _int_env("PROXY_TELEGRAM_CACHE_MIN_BYTES", DEFAULT_CACHE_MIN_BYTES)
     _cache_fields = parse_cache_fields(os.getenv("PROXY_TELEGRAM_CACHE_FIELDS"))
     if _cache_enabled:
-        _cache = TtlByteCache(
+        _cache = SqliteByteCache(
+            os.getenv("PROXY_SERVER_CACHE_DB_PATH", ".cache/server-cache.sqlite3"),
             ttl_seconds=_int_env("PROXY_TELEGRAM_CACHE_TTL_SECONDS", DEFAULT_CACHE_TTL_SECONDS),
             max_items=_int_env("PROXY_TELEGRAM_CACHE_MAX_ITEMS", DEFAULT_CACHE_MAX_ITEMS),
             max_bytes=_int_env("PROXY_TELEGRAM_CACHE_MAX_BYTES", DEFAULT_CACHE_MAX_BYTES),
