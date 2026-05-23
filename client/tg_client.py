@@ -1,7 +1,7 @@
 import os
 from typing import Awaitable, Callable, Optional
 
-from telegram import Update
+from telegram import InputFile, Update
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -72,5 +72,15 @@ async def send_frame(text: str) -> None:
     await _app.bot.send_message(
         chat_id=_bridge_chat_id,
         text=text,
+        disable_notification=True,
+    )
+
+
+async def send_document(caption: str, payload: bytes, filename: str) -> None:
+    assert _app is not None and _bridge_chat_id is not None
+    await _app.bot.send_document(
+        chat_id=_bridge_chat_id,
+        document=InputFile(payload, filename=filename),
+        caption=caption,
         disable_notification=True,
     )
