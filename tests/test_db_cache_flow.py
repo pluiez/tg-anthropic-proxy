@@ -85,13 +85,15 @@ def _install_client_cache(monkeypatch, cache: SqliteByteCache, *, cache_ts: int 
     monkeypatch.setattr(client_main, "CACHE_FIELDS", parse_cache_fields(None))
     monkeypatch.setattr(client_main, "_CACHE_DB", cache)
     monkeypatch.setattr(client_main, "now_epoch_ms", lambda: cache_ts)
+    monkeypatch.setattr(cache, "_now_ms_fn", lambda: cache_ts)
 
 
-def _install_server_cache(monkeypatch, cache: SqliteByteCache) -> None:
+def _install_server_cache(monkeypatch, cache: SqliteByteCache, *, cache_ts: int = 1_779_600_000_000) -> None:
     monkeypatch.setattr(relay, "_cache_enabled", True)
     monkeypatch.setattr(relay, "_cache_min_bytes", 1)
     monkeypatch.setattr(relay, "_cache_fields", parse_cache_fields(None))
     monkeypatch.setattr(relay, "_cache", cache)
+    monkeypatch.setattr(cache, "_now_ms_fn", lambda: cache_ts)
 
 
 def test_client_uses_local_db_hit_for_second_request(monkeypatch, tmp_path) -> None:
