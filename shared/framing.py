@@ -146,6 +146,7 @@ def chunk_request_envelope(
     rid: str,
     *,
     max_chars: int = MAX_TEXT_FRAME_CHARS,
+    last_extra: Optional[dict] = None,
 ) -> list[bytes]:
     # Use a conservative total hint while choosing chunks. The real total is no
     # longer than this in normal operation, so final frames are not larger.
@@ -155,6 +156,7 @@ def chunk_request_envelope(
         "req",
         max_chars=max_chars,
         extra={"total": _TOTAL_HINT},
+        last_extra=last_extra,
     )
 
 

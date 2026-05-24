@@ -256,51 +256,70 @@ async def _on_req_frame(frame: dict) -> None:
         _PARTS[rid][frame["seq"]] = payload
         if "total" in frame:
             _TOTAL[rid] = int(frame["total"])
+        eof = frame.get("eof") is True
         log.debug(
-            "[%s] server received req frame seq=%s total=%s bytes=%d collected=%d",
+            "[%s] server received req frame seq=%s total=%s bytes=%d collected=%d eof=%s",
             rid,
             frame.get("seq"),
             frame.get("total"),
             len(payload),
             len(_PARTS[rid]),
+            eof,
         )
+        if eof:
+            await _finalize_request(rid, frame.get("seq"), source="req_eof")
     elif kind == "req_end":
-        started = _REQUEST_STARTED.setdefault(rid, time.monotonic())
-        expected = _TOTAL.get(rid)
-        collected = len(_PARTS.get(rid, {}))
-        log.info(
-            "[%s] server received req_end seq=%s expected_chunks=%s collected_chunks=%d",
-            rid,
-            frame.get("seq"),
-            expected,
-            collected,
-        )
-        # Wait briefly for any req frames that arrived out of order.
-        for _ in range(40):
-            if rid in _TOTAL and len(_PARTS[rid]) >= _TOTAL[rid]:
-                break
-            await asyncio.sleep(0.05)
-        parts = _PARTS.pop(rid, {})
-        expected = _TOTAL.pop(rid, None)
-        if expected is not None and len(parts) < expected:
-            missing = sorted(set(range(expected)) - set(parts))
-            log.warning(
-                "[%s] server processing incomplete request expected_chunks=%d collected_chunks=%d missing=%s",
-                rid,
-                expected,
-                len(parts),
-                missing,
-            )
-        body = b"".join(parts[i] for i in sorted(parts))
-        log.info(
-            "[%s] server reassembled request envelope_bytes=%d elapsed=%.3fs",
-            rid,
-            len(body),
-            time.monotonic() - started,
-        )
-        asyncio.create_task(_process(rid, body))
+        await _finalize_request(rid, frame.get("seq"), source="req_end")
     else:
         log.debug("[%s] server ignored frame kind=%s", rid, kind)
+
+
+async def _finalize_request(rid: str, seq: Any, *, source: str) -> None:
+    started = _REQUEST_STARTED.setdefault(rid, time.monotonic())
+    expected = _TOTAL.get(rid)
+    collected = len(_PARTS.get(rid, {}))
+    log.info(
+        "[%s] server reassembly triggered source=%s seq=%s expected_chunks=%s collected_chunks=%d",
+        rid,
+        source,
+        seq,
+        expected,
+        collected,
+    )
+    # Wait briefly for any req frames that arrived out of order. The eof flag
+    # only means the last sequence number was sent — earlier frames may still
+    # be in flight on the Telegram side.
+    for _ in range(40):
+        total = _TOTAL.get(rid)
+        if total is not None and len(_PARTS.get(rid, {})) >= total:
+            break
+        await asyncio.sleep(0.05)
+    parts = _PARTS.pop(rid, None)
+    if parts is None:
+        # Another coroutine (e.g. legacy req_end after a new req eof) already
+        # finalized this request; drop the duplicate trigger.
+        log.debug("[%s] server skipped duplicate reassembly source=%s seq=%s", rid, source, seq)
+        return
+    expected = _TOTAL.pop(rid, None)
+    if expected is not None and len(parts) < expected:
+        missing = sorted(set(range(expected)) - set(parts))
+        log.warning(
+            "[%s] server processing incomplete request source=%s expected_chunks=%d collected_chunks=%d missing=%s",
+            rid,
+            source,
+            expected,
+            len(parts),
+            missing,
+        )
+    body = b"".join(parts[i] for i in sorted(parts))
+    log.info(
+        "[%s] server reassembled request source=%s envelope_bytes=%d elapsed=%.3fs",
+        rid,
+        source,
+        len(body),
+        time.monotonic() - started,
+    )
+    asyncio.create_task(_process(rid, body))
 
 
 async def _process(rid: str, raw: bytes) -> None:

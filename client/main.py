@@ -221,7 +221,12 @@ def _build_request_envelopes(
 
 
 async def _send_envelope(rid: str, envelope: bytes, *, reason: str) -> None:
-    chunks = chunk_request_envelope(envelope, rid, max_chars=FRAME_MAX_CHARS)
+    chunks = chunk_request_envelope(
+        envelope,
+        rid,
+        max_chars=FRAME_MAX_CHARS,
+        last_extra={"eof": True},
+    )
     total = len(chunks)
     use_document = DOCUMENT_CHUNK_THRESHOLD > 0 and total >= DOCUMENT_CHUNK_THRESHOLD
     log.info(
@@ -251,11 +256,23 @@ async def _send_envelope(rid: str, envelope: bytes, *, reason: str) -> None:
         log.info("[%s] client sent request document reason=%s blob_bytes=%d", rid, reason, len(blob))
         return
 
+    last_seq = total - 1
     for seq, c in enumerate(chunks):
-        log.debug("[%s] client send req chunk reason=%s seq=%d/%d bytes=%d", rid, reason, seq + 1, total, len(c))
-        await tg_client.send_frame(make_frame(rid, seq, "req", data=c, total=total))
-    await tg_client.send_frame(make_frame(rid, total, "req_end"))
-    log.info("[%s] client sent request end reason=%s seq=%d", rid, reason, total)
+        is_last = seq == last_seq
+        extra: dict[str, Any] = {"total": total}
+        if is_last:
+            extra["eof"] = True
+        log.debug(
+            "[%s] client send req chunk reason=%s seq=%d/%d bytes=%d eof=%s",
+            rid,
+            reason,
+            seq + 1,
+            total,
+            len(c),
+            is_last,
+        )
+        await tg_client.send_frame(make_frame(rid, seq, "req", data=c, **extra))
+    log.info("[%s] client sent request reason=%s frames=%d", rid, reason, total)
 
 
 async def _on_frame(frame: dict[str, Any]) -> None:
