@@ -1,3 +1,5 @@
+import random
+
 from shared.framing import (
     MAX_TEXT_FRAME_CHARS,
     chunk_bytes,
@@ -7,6 +9,7 @@ from shared.framing import (
     decode_request_blob,
     make_frame,
     make_request_blob,
+    parse_frame,
     parse_request_blob_caption,
 )
 
@@ -101,3 +104,40 @@ def test_dynamic_payload_chunks_respect_nonzero_start_seq() -> None:
         <= MAX_TEXT_FRAME_CHARS
         for offset, chunk in enumerate(chunks)
     )
+
+
+def test_dynamic_payload_chunks_count_last_extra_only_on_final_frame() -> None:
+    rid = "r_test123456"
+    rng = random.Random(0)
+    data = bytes(rng.randrange(256) for _ in range(20_000))
+    start_seq = 7
+
+    chunks = chunk_bytes_for_frame_payloads(
+        data,
+        rid,
+        "resp_chunk",
+        max_chars=1024,
+        last_extra={"eof": True},
+        start_seq=start_seq,
+    )
+
+    assert len(chunks) > 1
+    assert b"".join(chunks) == data
+
+    frames = [
+        make_frame(
+            rid,
+            start_seq + offset,
+            "resp_chunk",
+            data=chunk,
+            **({"eof": True} if offset == len(chunks) - 1 else {}),
+        )
+        for offset, chunk in enumerate(chunks)
+    ]
+    parsed = [parse_frame(frame) for frame in frames]
+
+    assert all(len(frame) <= 1024 for frame in frames)
+    assert all(frame is not None for frame in parsed)
+    assert [frame.get("eof") for frame in parsed[:-1] if frame is not None] == [None] * (len(chunks) - 1)
+    assert parsed[-1] is not None
+    assert parsed[-1]["eof"] is True

@@ -92,6 +92,7 @@ def chunk_bytes_for_frame_payloads(
     *,
     max_chars: int = MAX_TEXT_FRAME_CHARS,
     extra: Optional[dict] = None,
+    last_extra: Optional[dict] = None,
     start_seq: int = 0,
 ) -> list[bytes]:
     """Pack payload chunks using actual encoded frame length.
@@ -99,13 +100,18 @@ def chunk_bytes_for_frame_payloads(
     Fixed raw chunking is safe but very inefficient for large, compressible JSON
     requests because each chunk is gzipped independently. This helper keeps the
     existing frame format while choosing the largest raw chunk whose encoded
-    Telegram message stays below ``max_chars``.
+    Telegram message stays below ``max_chars``. ``last_extra`` is only counted
+    against the final frame so EOF markers can be merged without oversizing it.
     """
     max_chars = coerce_text_frame_chars(max_chars)
+    frame_extra = dict(extra or {})
+    final_frame_extra = dict(frame_extra)
+    final_frame_extra.update(last_extra or {})
     if not data:
+        if len(make_frame(rid, start_seq, kind, data=b"", **final_frame_extra)) > max_chars:
+            raise ValueError("empty frame exceeds Telegram text limit")
         return [b""]
 
-    frame_extra = dict(extra or {})
     chunks: list[bytes] = []
     offset = 0
     while offset < len(data):
@@ -117,7 +123,8 @@ def chunk_bytes_for_frame_payloads(
         while low <= high:
             mid = (low + high) // 2
             candidate = data[offset:offset + mid]
-            frame = make_frame(rid, seq, kind, data=candidate, **frame_extra)
+            candidate_extra = final_frame_extra if mid == remaining else frame_extra
+            frame = make_frame(rid, seq, kind, data=candidate, **candidate_extra)
             if len(frame) <= max_chars:
                 best = mid
                 low = mid + 1
@@ -125,7 +132,8 @@ def chunk_bytes_for_frame_payloads(
                 high = mid - 1
 
         chunk = data[offset:offset + best]
-        if len(make_frame(rid, seq, kind, data=chunk, **frame_extra)) > max_chars:
+        chunk_extra = final_frame_extra if best == remaining else frame_extra
+        if len(make_frame(rid, seq, kind, data=chunk, **chunk_extra)) > max_chars:
             raise ValueError("single-byte frame exceeds Telegram text limit")
         chunks.append(chunk)
         offset += best

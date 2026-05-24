@@ -277,8 +277,18 @@ async def _on_frame(frame: dict[str, Any]) -> None:
         q.put_nowait(CacheMiss(keys))
     elif kind == "resp_chunk":
         payload = frame["payload"]
-        log.debug("[%s] client received response chunk seq=%s bytes=%d", rid, frame.get("seq"), len(payload))
-        q.put_nowait(payload)
+        eof = frame.get("eof") is True
+        log.debug(
+            "[%s] client received response chunk seq=%s bytes=%d eof=%s",
+            rid,
+            frame.get("seq"),
+            len(payload),
+            eof,
+        )
+        if payload:
+            q.put_nowait(payload)
+        if eof:
+            q.put_nowait(_END)
     elif kind == "resp_end":
         log.info("[%s] client received response end seq=%s", rid, frame.get("seq"))
         q.put_nowait(_END)

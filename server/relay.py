@@ -349,48 +349,55 @@ async def _process(rid: str, raw: bytes) -> None:
     upstream_bytes = 0
     telegram_chunks = 0
 
-    async def flush(reason: str) -> None:
+    async def flush(reason: str, *, eof: bool = False) -> None:
         nonlocal seq, last_flush, telegram_chunks
-        if not buf:
+        if not buf and not eof:
             return
         data = bytes(buf)
         buf.clear()
+        last_extra = {"eof": True} if eof else None
         chunks = chunk_bytes_for_frame_payloads(
             data,
             rid,
             "resp_chunk",
             max_chars=RESPONSE_FRAME_MAX_CHARS,
+            last_extra=last_extra,
             start_seq=seq,
         )
         log.info(
-            "[%s] server flushing response reason=%s bytes=%d telegram_frames=%d next_seq=%d frame_max_chars=%d",
+            "[%s] server flushing response reason=%s bytes=%d telegram_frames=%d next_seq=%d frame_max_chars=%d eof=%s",
             rid,
             reason,
             len(data),
             len(chunks),
             seq,
             RESPONSE_FRAME_MAX_CHARS,
+            eof,
         )
-        for chunk in chunks:
-            frame = make_frame(rid, seq, "resp_chunk", data=chunk)
+        for offset, chunk in enumerate(chunks):
+            frame_eof = eof and offset == len(chunks) - 1
+            frame_extra = {"eof": True} if frame_eof else {}
+            frame = make_frame(rid, seq, "resp_chunk", data=chunk, **frame_extra)
             frame_chars = len(frame)
             send_started = time.monotonic()
             log.info(
-                "[%s] server sending response frame reason=%s seq=%d bytes=%d frame_chars=%d",
+                "[%s] server sending response frame reason=%s seq=%d bytes=%d frame_chars=%d eof=%s",
                 rid,
                 reason,
                 seq,
                 len(chunk),
                 frame_chars,
+                frame_eof,
             )
             await _send(frame)
             log.info(
-                "[%s] server sent response frame reason=%s seq=%d bytes=%d frame_chars=%d elapsed=%.3fs",
+                "[%s] server sent response frame reason=%s seq=%d bytes=%d frame_chars=%d eof=%s elapsed=%.3fs",
                 rid,
                 reason,
                 seq,
                 len(chunk),
                 frame_chars,
+                frame_eof,
                 time.monotonic() - send_started,
             )
             telegram_chunks += 1
@@ -430,24 +437,14 @@ async def _process(rid: str, raw: bytes) -> None:
                     or (time.monotonic() - last_flush) >= RESPONSE_FLUSH_INTERVAL
                 ):
                     await flush("interval_or_size")
-            await flush("eof")
+            await flush("eof", eof=True)
     except Exception as e:
         log.exception("[%s] server relay error upstream=%s", rid, url)
         await _send(make_frame(rid, seq, "resp_error", error=str(e)))
         return
 
-    end_frame = make_frame(rid, seq, "resp_end")
-    end_started = time.monotonic()
-    await _send(end_frame)
     log.info(
-        "[%s] server sent response end seq=%d frame_chars=%d elapsed=%.3fs",
-        rid,
-        seq,
-        len(end_frame),
-        time.monotonic() - end_started,
-    )
-    log.info(
-        "[%s] server completed response upstream_bytes=%d telegram_chunks=%d end_seq=%d elapsed=%.3fs stored_cache_keys=%d used_cache_keys=%d",
+        "[%s] server completed response upstream_bytes=%d telegram_chunks=%d final_seq=%d elapsed=%.3fs stored_cache_keys=%d used_cache_keys=%d",
         rid,
         upstream_bytes,
         telegram_chunks,
