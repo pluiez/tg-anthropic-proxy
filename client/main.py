@@ -12,7 +12,7 @@ load_dotenv()
 
 import uvicorn  # noqa: E402
 from fastapi import FastAPI, Request, Response  # noqa: E402
-from fastapi.responses import StreamingResponse  # noqa: E402
+from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
 
 from client import tg_client  # noqa: E402
 from client.routing import anthropic_v1_path  # noqa: E402
@@ -93,6 +93,14 @@ class CacheMiss(RuntimeError):
     def __init__(self, keys: list[str]) -> None:
         self.keys = keys
         super().__init__("cache miss: " + ",".join(keys))
+
+
+async def _send_cancel_best_effort(rid: str, *, reason: str) -> None:
+    try:
+        await tg_client.send_frame(make_frame(rid, 0, "cancel", reason=reason))
+        log.info("[%s] client sent cancel reason=%s", rid, reason)
+    except Exception as exc:  # noqa: BLE001 - best effort, never raise to caller
+        log.warning("[%s] client failed to send cancel reason=%s error=%s", rid, reason, exc)
 
 
 def _client_addr(request: Request) -> str:
@@ -384,16 +392,33 @@ async def proxy(path: str, request: Request):
     q: asyncio.Queue = asyncio.Queue()
     PENDING[rid] = q
 
-    await _send_envelope(
-        rid,
-        initial_envelope,
-        reason="cache_ref" if initial_envelope != full_envelope else "full",
-    )
+    try:
+        await _send_envelope(
+            rid,
+            initial_envelope,
+            reason="cache_ref" if initial_envelope != full_envelope else "full",
+        )
+    except Exception as exc:  # noqa: BLE001 - convert to clean 502, never leak traceback
+        PENDING.pop(rid, None)
+        elapsed = time.monotonic() - started
+        log.warning(
+            "[%s] client send_envelope failed elapsed=%.3fs error=%s",
+            rid,
+            elapsed,
+            exc,
+        )
+        await _send_cancel_best_effort(rid, reason="send_envelope_failed")
+        return JSONResponse(
+            {"type": "proxy_error", "message": f"telegram bridge send failed: {exc}"},
+            status_code=502,
+        )
 
     async def gen():
         response_chunks = 0
         response_bytes = 0
         replayed_full_after_cache_miss = False
+        done_cleanly = False
+        cancel_reason = "stream_disconnect"
         try:
             while True:
                 try:
@@ -408,6 +433,7 @@ async def proxy(path: str, request: Request):
                         response_bytes,
                         elapsed,
                     )
+                    cancel_reason = "response_timeout"
                     err = {"type": "proxy_error", "message": "response timeout"}
                     yield f"event: error\ndata: {json.dumps(err)}\n\n".encode("utf-8")
                     return
@@ -415,6 +441,7 @@ async def proxy(path: str, request: Request):
                     elapsed = time.monotonic() - started
                     if replayed_full_after_cache_miss:
                         log.warning("[%s] client repeated cache miss after full replay keys=%s elapsed=%.3fs", rid, item.keys, elapsed)
+                        cancel_reason = "cache_inconsistency"
                         err = {"type": "proxy_error", "message": CACHE_INCONSISTENCY_MESSAGE}
                         yield f"event: error\ndata: {json.dumps(err)}\n\n".encode("utf-8")
                         return
@@ -428,12 +455,20 @@ async def proxy(path: str, request: Request):
                         elapsed,
                     )
                     if not allowed:
+                        cancel_reason = "cache_replay_limit"
                         err = {"type": "proxy_error", "message": CACHE_INCONSISTENCY_MESSAGE}
                         yield f"event: error\ndata: {json.dumps(err)}\n\n".encode("utf-8")
                         return
                     replayed_full_after_cache_miss = True
                     log.info("[%s] client replaying full request after cache miss keys=%s", rid, item.keys)
-                    await _send_envelope(rid, full_envelope, reason="cache_miss_replay")
+                    try:
+                        await _send_envelope(rid, full_envelope, reason="cache_miss_replay")
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("[%s] client cache miss replay send failed error=%s", rid, exc)
+                        cancel_reason = "cache_miss_replay_failed"
+                        err = {"type": "proxy_error", "message": f"telegram bridge send failed: {exc}"}
+                        yield f"event: error\ndata: {json.dumps(err)}\n\n".encode("utf-8")
+                        return
                     continue
                 if item is _END:
                     elapsed = time.monotonic() - started
@@ -444,6 +479,7 @@ async def proxy(path: str, request: Request):
                         response_bytes,
                         elapsed,
                     )
+                    done_cleanly = True
                     return
                 if isinstance(item, Exception):
                     elapsed = time.monotonic() - started
@@ -455,6 +491,9 @@ async def proxy(path: str, request: Request):
                         elapsed,
                         item,
                     )
+                    # Server-side error: server has already finished with this rid,
+                    # no orphan to cancel.
+                    done_cleanly = True
                     err = {"type": "proxy_error", "message": str(item)}
                     yield f"event: error\ndata: {json.dumps(err)}\n\n".encode("utf-8")
                     return
@@ -464,6 +503,10 @@ async def proxy(path: str, request: Request):
                 yield item
         finally:
             PENDING.pop(rid, None)
+            if not done_cleanly:
+                # Fire-and-forget so generator cleanup is not blocked on Telegram
+                # and survives GeneratorExit/CancelledError on disconnect.
+                asyncio.create_task(_send_cancel_best_effort(rid, reason=cancel_reason))
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 

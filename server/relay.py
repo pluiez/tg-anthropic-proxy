@@ -48,6 +48,12 @@ RESPONSE_FLUSH_INTERVAL = DEFAULT_RESPONSE_FLUSH_INTERVAL
 RESPONSE_FLUSH_BYTES = DEFAULT_RESPONSE_FLUSH_BYTES
 RESPONSE_FRAME_MAX_CHARS = MAX_TEXT_FRAME_CHARS
 
+# How long a cancelled rid stays in the orphan-drop table. Long enough to catch
+# late text frames or a slow Telegram document delivery; short enough that the
+# dict cannot grow unbounded under churn.
+DEFAULT_CANCEL_TTL_SECONDS = 300.0
+CANCEL_TTL_SECONDS = DEFAULT_CANCEL_TTL_SECONDS
+
 log = logging.getLogger(__name__)
 
 _app: Optional[Application] = None
@@ -75,6 +81,11 @@ class RequestCacheMiss(RuntimeError):
 _PARTS: dict[str, dict[int, bytes]] = defaultdict(dict)
 _TOTAL: dict[str, int] = {}
 _REQUEST_STARTED: dict[str, float] = {}
+# Cancel/orphan tracking. _CANCELLED maps rid -> monotonic expiration; _TASKS
+# tracks the in-flight asyncio.Task for _process so a late cancel frame can
+# interrupt an upstream stream that is already running.
+_CANCELLED: dict[str, float] = {}
+_TASKS: dict[str, asyncio.Task] = {}
 
 
 def _int_env(name: str, default: int) -> int:
@@ -129,6 +140,39 @@ async def _send(text: str) -> None:
         text=text,
         disable_notification=True,
     )
+
+
+def _prune_cancelled(now: float | None = None) -> None:
+    if now is None:
+        now = time.monotonic()
+    expired = [rid for rid, exp in _CANCELLED.items() if exp <= now]
+    for rid in expired:
+        _CANCELLED.pop(rid, None)
+
+
+def _is_cancelled(rid: str) -> bool:
+    exp = _CANCELLED.get(rid)
+    if exp is None:
+        return False
+    if exp <= time.monotonic():
+        _CANCELLED.pop(rid, None)
+        return False
+    return True
+
+
+def _mark_cancelled(rid: str, *, reason: str) -> None:
+    now = time.monotonic()
+    _CANCELLED[rid] = now + CANCEL_TTL_SECONDS
+    _PARTS.pop(rid, None)
+    _TOTAL.pop(rid, None)
+    _REQUEST_STARTED.pop(rid, None)
+    task = _TASKS.pop(rid, None)
+    if task is not None and not task.done():
+        task.cancel()
+        log.info("[%s] server cancelling in-flight task reason=%s", rid, reason)
+    else:
+        log.info("[%s] server marked cancelled reason=%s", rid, reason)
+    _prune_cancelled(now)
 
 
 def _cache_get(key: str) -> bytes | None:
@@ -209,6 +253,14 @@ async def _on_req_document(msg) -> bool:
         return False
 
     rid = metadata["rid"]
+    if _is_cancelled(rid):
+        log.info(
+            "[%s] server dropped cancelled document file_id=%s file_size=%s",
+            rid,
+            document.file_id,
+            document.file_size,
+        )
+        return True
     started = time.monotonic()
     _REQUEST_STARTED[rid] = started
     log.info(
@@ -243,13 +295,20 @@ async def _on_req_document(msg) -> bool:
     )
     _PARTS.pop(rid, None)
     _TOTAL.pop(rid, None)
-    asyncio.create_task(_process(rid, raw))
+    if _is_cancelled(rid):
+        _REQUEST_STARTED.pop(rid, None)
+        log.info("[%s] server dropped cancelled document after download blob_bytes=%d", rid, len(blob))
+        return True
+    _TASKS[rid] = asyncio.create_task(_process(rid, raw))
     return True
 
 
 async def _on_req_frame(frame: dict) -> None:
     rid = frame["rid"]
     kind = frame["kind"]
+    if _is_cancelled(rid):
+        log.debug("[%s] server dropped cancelled frame kind=%s seq=%s", rid, kind, frame.get("seq"))
+        return
     if kind == "req":
         payload = frame["payload"]
         _REQUEST_STARTED.setdefault(rid, time.monotonic())
@@ -272,6 +331,13 @@ async def _on_req_frame(frame: dict) -> None:
         await _finalize_request(rid, frame.get("seq"), source="req_end")
     else:
         log.debug("[%s] server ignored frame kind=%s", rid, kind)
+
+
+async def _on_cancel(frame: dict) -> None:
+    rid = frame["rid"]
+    reason = frame.get("reason")
+    reason_str = str(reason) if isinstance(reason, str) else "unspecified"
+    _mark_cancelled(rid, reason=reason_str)
 
 
 async def _finalize_request(rid: str, seq: Any, *, source: str) -> None:
@@ -319,11 +385,30 @@ async def _finalize_request(rid: str, seq: Any, *, source: str) -> None:
         len(body),
         time.monotonic() - started,
     )
-    asyncio.create_task(_process(rid, body))
+    if _is_cancelled(rid):
+        _REQUEST_STARTED.pop(rid, None)
+        log.info("[%s] server dropped cancelled request after reassembly source=%s", rid, source)
+        return
+    _TASKS[rid] = asyncio.create_task(_process(rid, body))
 
 
 async def _process(rid: str, raw: bytes) -> None:
+    try:
+        await _process_impl(rid, raw)
+    except asyncio.CancelledError:
+        # Client gave up on this rid; do not send further response/error frames
+        # over the bridge.
+        log.info("[%s] server task cancelled mid-flight", rid)
+        raise
+    finally:
+        _TASKS.pop(rid, None)
+
+
+async def _process_impl(rid: str, raw: bytes) -> None:
     started = _REQUEST_STARTED.pop(rid, time.monotonic())
+    if _is_cancelled(rid):
+        log.info("[%s] server skipped cancelled task at start", rid)
+        return
     try:
         envelope = json.loads(raw.decode("utf-8"))
     except Exception as e:
@@ -486,7 +571,12 @@ async def _handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not msg.text:
         return
     frame = parse_frame(msg.text)
-    if frame is not None and frame["kind"] in ("req", "req_end"):
+    if frame is None:
+        return
+    kind = frame["kind"]
+    if kind == "cancel":
+        await _on_cancel(frame)
+    elif kind in ("req", "req_end"):
         await _on_req_frame(frame)
 
 
@@ -494,6 +584,7 @@ async def serve(*, use_cc_proxy: bool = False) -> None:
     global _app, _http, _bridge_chat_id, _anthropic_base, _use_cc_proxy
     global _cache_enabled, _cache_min_bytes, _cache_fields, _cache
     global RESPONSE_FLUSH_INTERVAL, RESPONSE_FLUSH_BYTES, RESPONSE_FRAME_MAX_CHARS
+    global CANCEL_TTL_SECONDS
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -511,6 +602,9 @@ async def serve(*, use_cc_proxy: bool = False) -> None:
     RESPONSE_FRAME_MAX_CHARS = coerce_text_frame_chars(
         os.getenv("PROXY_TELEGRAM_RESPONSE_FRAME_MAX_CHARS") or os.getenv("PROXY_TELEGRAM_FRAME_MAX_CHARS"),
         default=MAX_TEXT_FRAME_CHARS,
+    )
+    CANCEL_TTL_SECONDS = max(
+        1.0, _float_env("PROXY_SERVER_CANCEL_TTL_SECONDS", DEFAULT_CANCEL_TTL_SECONDS)
     )
 
     _cache_enabled = _bool_env("PROXY_TELEGRAM_CACHE_ENABLED", True)
@@ -558,7 +652,7 @@ async def serve(*, use_cc_proxy: bool = False) -> None:
     )
 
     log.info(
-        "Server up on bridge chat %s, upstream %s, use_cc_proxy=%s cache_enabled=%s cache_fields=%s cache_min_bytes=%d response_flush_interval=%.3f response_flush_bytes=%d response_frame_max_chars=%d",
+        "Server up on bridge chat %s, upstream %s, use_cc_proxy=%s cache_enabled=%s cache_fields=%s cache_min_bytes=%d response_flush_interval=%.3f response_flush_bytes=%d response_frame_max_chars=%d cancel_ttl_seconds=%.1f",
         _bridge_chat_id,
         _anthropic_base,
         _use_cc_proxy,
@@ -568,6 +662,7 @@ async def serve(*, use_cc_proxy: bool = False) -> None:
         RESPONSE_FLUSH_INTERVAL,
         RESPONSE_FLUSH_BYTES,
         RESPONSE_FRAME_MAX_CHARS,
+        CANCEL_TTL_SECONDS,
     )
     try:
         await asyncio.Event().wait()

@@ -15,6 +15,14 @@ from shared.framing import parse_frame
 _app: Optional[Application] = None
 _on_frame: Optional[Callable[[dict], Awaitable[None]]] = None
 _bridge_chat_id: Optional[int] = None
+_document_timeouts: dict[str, float] = {}
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 
 async def _handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -27,10 +35,16 @@ async def _handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def start(on_frame: Callable[[dict], Awaitable[None]]) -> None:
-    global _app, _on_frame, _bridge_chat_id
+    global _app, _on_frame, _bridge_chat_id, _document_timeouts
     _on_frame = on_frame
     _bridge_chat_id = int(os.environ["BRIDGE_CHAT_ID"])
     token = os.environ["BOT_A_TOKEN"]
+    _document_timeouts = {
+        "connect_timeout": _float_env("PROXY_TELEGRAM_DOCUMENT_CONNECT_TIMEOUT", 10.0),
+        "write_timeout": _float_env("PROXY_TELEGRAM_DOCUMENT_WRITE_TIMEOUT", 60.0),
+        "read_timeout": _float_env("PROXY_TELEGRAM_DOCUMENT_READ_TIMEOUT", 60.0),
+        "pool_timeout": _float_env("PROXY_TELEGRAM_DOCUMENT_POOL_TIMEOUT", 10.0),
+    }
 
     # Group rate is intentionally higher than Telegram's documented 1 msg/s/chat
     # for private groups — PTB's AIORateLimiter handles 429 backoff automatically
@@ -83,4 +97,5 @@ async def send_document(caption: str, payload: bytes, filename: str) -> None:
         document=InputFile(payload, filename=filename),
         caption=caption,
         disable_notification=True,
+        **_document_timeouts,
     )

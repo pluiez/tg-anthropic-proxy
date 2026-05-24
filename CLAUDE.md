@@ -73,9 +73,10 @@ All Telegram text messages are single JSON objects:
 
 | Direction | Kind | Notes |
 |-----------|------|-------|
-| client → server | `req` | chunked envelope payload (gzip+base64 in `data`) |
-| client → server | `req_end` | signals last chunk |
+| client → server | `req` | chunked envelope payload (gzip+base64 in `data`); last frame has `eof=true` and the new server uses that as the reassembly trigger |
+| client → server | `req_end` | legacy last-chunk marker; new clients no longer emit it but server still accepts it |
 | client → server | document | `req_blob` caption + gzip file (replaces many `req` frames) |
+| client → server | `cancel` | best-effort orphan-cancel for a rid the client has given up on (send failure, response timeout, HTTP disconnect) |
 | server → client | `resp_chunk` | streamed response bytes |
 | server → client | `resp_end` | response complete |
 | server → client | `resp_error` | upstream or relay error |
