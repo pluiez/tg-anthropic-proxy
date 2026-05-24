@@ -68,6 +68,10 @@ Response-side optimizations:
 - Response frames use dynamic encoded-length packing, matching the request-side safety check.
 - Server logs include response flush and per-frame Telegram send timing for debugging slow or timed-out requests.
 
+Benchmark notes:
+
+- Telegram channel send-rate measurements are recorded in [docs/benchmarks/telegram-channel-rate-limit.md](docs/benchmarks/telegram-channel-rate-limit.md).
+
 ## Development
 
 Install dependencies:
