@@ -53,13 +53,13 @@ Request-side optimizations:
 
 - Dynamic text-frame packing validates the actual encoded Telegram message length instead of using only a fixed raw byte size.
 - Large request envelopes can use a compressed Telegram document fallback to avoid many text messages and Telegram flood limits.
-- Protocol-level cache references let repeated Claude Code `tools`, `system`, and `messages` prefixes cross the bridge as small 64-hex sha256 refs when the client local SQLite DB already has the canonical JSON bytes.
+- Protocol-level cache references let repeated Claude Code `tools` and reusable `system`/`messages` content blocks cross the bridge as small 64-hex sha256 refs when the client local SQLite DB already has the canonical JSON bytes.
 - Both client and server keep local SQLite cache DBs with a default TTL of 72 hours. The protocol no longer sends `cache_ack`; if the server DB misses a ref, the client can replay the same request envelope in full up to `PROXY_CACHE_CLIENT_HIT_SERVER_MISS_MAX_REPLAYS` times per process.
 
 Known Claude Code cache invalidators:
 
-- Claude Code can prepend a short `system` block like `x-anthropic-billing-header: ...; cch=...;`. The `cch` value has been observed changing between otherwise identical requests. Because the bridge hashes the complete canonical `system` JSON value, this makes the local `system` cache key unstable. Since Anthropic prompt caching is prefix-based in `tools -> system -> messages` order, the changing first `system` block can also prevent later `system` or `messages` prompt-cache breakpoints from matching upstream.
-- With Claude Code `2.1.140` and `figma@claude-plugins-official` `2.2.12`, the Figma plugin skill list in the injected `messages[0].content[0]` `<system-reminder>` has been observed with nondeterministic ordering. The same eight `figma:*` skills stay in one contiguous region, but their internal order changes between requests, making the complete canonical `messages` JSON value hash differently. Disabling or uninstalling the Figma plugin removes this source of `messages` cache misses.
+- Claude Code can prepend a short `system` block like `x-anthropic-billing-header: ...; cch=...;`. The `cch` value has been observed changing between otherwise identical requests. Content-block cache granularity keeps this from invalidating unrelated local bridge cache entries, but Anthropic prompt caching is still prefix-based in `tools -> system -> messages` order, so the changing first `system` block can prevent later upstream prompt-cache breakpoints from matching.
+- With Claude Code `2.1.140` and `figma@claude-plugins-official` `2.2.12`, the Figma plugin skill list in the injected `messages[0].content[0]` `<system-reminder>` was observed with nondeterministic ordering. Content-block cache granularity limits the local bridge miss to that injected block, and disabling or uninstalling the Figma plugin removes that source of churn entirely.
 
 Response-side optimizations:
 

@@ -58,7 +58,7 @@ This project tunnels Anthropic API HTTP requests through a Telegram group as the
 
 **shared/**: Transport-neutral helpers used by both client and server.
 - `framing.py`: `make_frame`/`parse_frame` (gzip+base64 JSON), `chunk_request_envelope` (binary search to fit frames within Telegram's 4096-char limit), `make_request_blob`/`decode_request_blob` (single-document transport for large requests).
-- `cache_protocol.py`: Telegram bridge cache — replaces large `tools`, `system`, and `messages` prefixes with bare 64-hex sha256 refs in the envelope so repeated Claude Code turns cross the bridge cheaply.
+- `cache_protocol.py`: Telegram bridge cache — replaces the large `tools` field and reusable `system`/`messages` content blocks with bare 64-hex sha256 refs in the envelope so repeated Claude Code turns cross the bridge cheaply.
 - `cache_db.py`: Local SQLite TTL+size-bounded byte cache used independently by client and server. The server no longer sends `cache_ack`; if its DB misses a ref, the client can replay the full envelope.
 - `cache_store.py`: Legacy in-memory TTL+size-bounded byte cache retained for tests/compatibility.
 - `logging_utils.py`: `redact_headers` and `summarize_json_body` for safe structured logging.

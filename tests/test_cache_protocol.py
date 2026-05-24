@@ -1,3 +1,5 @@
+import json
+
 from shared.cache_protocol import (
     CACHE_REF_KEY,
     MESSAGES_CACHE_KEY,
@@ -9,6 +11,17 @@ from shared.cache_protocol import (
 )
 
 
+def _image_block(seed: str) -> dict:
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": seed * 80,
+        },
+    }
+
+
 def _body() -> dict:
     return {
         "model": "claude-opus-4-7",
@@ -16,11 +29,20 @@ def _body() -> dict:
             {"name": "tool_a", "description": "A" * 64, "input_schema": {"type": "object"}},
             {"name": "tool_b", "description": "B" * 64, "input_schema": {"type": "object"}},
         ],
-        "system": [{"type": "text", "text": "system prompt " * 20}],
+        "system": [
+            {"type": "text", "text": "volatile cch=abcde"},
+            {"type": "text", "text": "system prompt " * 20},
+            _image_block("s"),
+        ],
         "messages": [
-            {"role": "user", "content": "first " * 40},
-            {"role": "assistant", "content": "second " * 40},
-            {"role": "user", "content": "third"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first " * 40},
+                    _image_block("m"),
+                ],
+            },
+            {"role": "assistant", "content": "string content is not a content block"},
         ],
     }
 
@@ -33,60 +55,86 @@ def test_cache_key_is_bare_64_hex_digest() -> None:
     int(key, 16)
 
 
-def test_cache_candidates_include_tools_system_and_message_prefixes() -> None:
+def test_cache_candidates_include_tools_and_content_blocks() -> None:
     candidates = cache_candidates_for_body(_body(), min_bytes=1)
 
-    kinds = [(candidate.kind, candidate.prefix_len) for candidate in candidates]
-    assert ("tools", None) in kinds
-    assert ("system", None) in kinds
-    assert ("messages", 1) in kinds
-    assert ("messages", 2) in kinds
-    assert ("messages", 3) in kinds
+    candidates_by_path = {(candidate.kind, candidate.path) for candidate in candidates}
+    assert ("tools", ("tools",)) in candidates_by_path
+    assert ("system_block", ("system", 0)) in candidates_by_path
+    assert ("system_block", ("system", 1)) in candidates_by_path
+    assert ("system_block", ("system", 2)) in candidates_by_path
+    assert ("message_content_block", ("messages", 0, "content", 0)) in candidates_by_path
+    assert ("message_content_block", ("messages", 0, "content", 1)) in candidates_by_path
+    assert not any(candidate.kind == "messages" for candidate in candidates)
 
 
-def test_compress_and_restore_uses_known_top_level_and_longest_message_prefix() -> None:
+def test_compress_and_restore_uses_known_top_level_and_content_blocks() -> None:
     body = _body()
     candidates = cache_candidates_for_body(body, min_bytes=1)
     tools = next(candidate for candidate in candidates if candidate.kind == "tools")
-    system = next(candidate for candidate in candidates if candidate.kind == "system")
-    messages_1 = next(candidate for candidate in candidates if candidate.kind == "messages" and candidate.prefix_len == 1)
-    messages_2 = next(candidate for candidate in candidates if candidate.kind == "messages" and candidate.prefix_len == 2)
+    stable_system = next(candidate for candidate in candidates if candidate.path == ("system", 1))
+    message_image = next(
+        candidate for candidate in candidates if candidate.path == ("messages", 0, "content", 1)
+    )
     store = {candidate.key: candidate.data for candidate in candidates}
 
     result = compress_body_with_cache_refs(
         body,
-        {tools.key, system.key, messages_1.key, messages_2.key},
+        {tools.key, stable_system.key, message_image.key},
         min_bytes=1,
     )
 
     assert result is not None
-    assert result.messages_prefix_len == 2
+    assert result.messages_prefix_len == 0
     assert result.body["tools"][CACHE_REF_KEY]["key"] == tools.key
-    assert result.body["system"][CACHE_REF_KEY]["key"] == system.key
-    assert result.body["messages"][MESSAGES_CACHE_KEY]["prefix"]["key"] == messages_2.key
-    assert result.body["messages"][MESSAGES_CACHE_KEY]["tail"] == body["messages"][2:]
+    assert result.body["system"][0] == body["system"][0]
+    assert result.body["system"][1][CACHE_REF_KEY]["key"] == stable_system.key
+    assert result.body["messages"][0]["content"][0] == body["messages"][0]["content"][0]
+    assert result.body["messages"][0]["content"][1][CACHE_REF_KEY]["key"] == message_image.key
 
     restored = restore_body_from_cache_refs(result.body, store.get)
 
     assert restored.missing_keys == []
-    assert set(restored.used_keys) == {tools.key, system.key, messages_2.key}
+    assert set(restored.used_keys) == {tools.key, stable_system.key, message_image.key}
     assert restored.body == body
 
 
-def test_restore_reports_cache_miss_without_mutating_tail() -> None:
+def test_restore_reports_nested_content_block_cache_miss() -> None:
     body = _body()
-    messages_1 = next(
+    message_text = next(
         candidate
         for candidate in cache_candidates_for_body(body, min_bytes=1)
-        if candidate.kind == "messages" and candidate.prefix_len == 1
+        if candidate.path == ("messages", 0, "content", 0)
     )
-    result = compress_body_with_cache_refs(body, {messages_1.key}, min_bytes=1)
+    result = compress_body_with_cache_refs(body, {message_text.key}, min_bytes=1)
 
     assert result is not None
     restored = restore_body_from_cache_refs(result.body, lambda key: None)
 
-    assert restored.missing_keys == [messages_1.key]
+    assert restored.missing_keys == [message_text.key]
     assert restored.used_keys == []
+
+
+def test_restore_supports_legacy_message_prefix_wrapper() -> None:
+    body = _body()
+    prefix = body["messages"][:1]
+    tail = body["messages"][1:]
+    key = "a" * 64
+    wrapped = {
+        **body,
+        "messages": {
+            MESSAGES_CACHE_KEY: {
+                "prefix": {"key": key, "kind": "messages", "size": 1, "prefix_len": 1},
+                "tail": tail,
+            }
+        },
+    }
+
+    restored = restore_body_from_cache_refs(wrapped, {key: json.dumps(prefix).encode("utf-8")}.get)
+
+    assert restored.missing_keys == []
+    assert restored.used_keys == [key]
+    assert restored.body == body
 
 
 def test_parse_cache_fields_ignores_unknown_fields() -> None:
