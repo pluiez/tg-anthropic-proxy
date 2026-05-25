@@ -118,6 +118,12 @@ async def health(request: Request):
     }
 
 
+@app.head("/")
+async def root_head(request: Request) -> Response:
+    log.info("cc_proxy root HEAD probe from=%s", request.client.host if request.client else "unknown")
+    return Response(status_code=204)
+
+
 @app.api_route(
     "/{path:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
