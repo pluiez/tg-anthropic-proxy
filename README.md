@@ -2,6 +2,34 @@
 
 Anthropic-compatible API proxy that tunnels requests through a Telegram bridge.
 
+## Setup: bots and bridge channel
+
+The bridge requires two Telegram bots and one shared Telegram **channel** (not a group — group transport is not used here). Steps below assume the official Telegram client and `curl`.
+
+1. Create two bots in [@BotFather](https://t.me/BotFather):
+   - Send `/newbot` twice. The first bot becomes bot A (used by `client`, token goes into `BOT_A_TOKEN`); the second becomes bot B (used by `server`, token goes into `BOT_B_TOKEN`).
+   - Bot privacy mode does not affect channel posts, so no `/setprivacy` change is required.
+
+2. Create a private channel in Telegram (any name; channel mode, not group), then add both bots as **administrators**:
+   - Channel → Manage Channel → Administrators → Add Admin → search the bot username → grant at minimum "Post Messages" and "Delete Messages". Repeat for the other bot.
+   - Both bots must be admins of the same channel; otherwise neither side can read or send frames.
+
+3. Discover the channel ID (`BRIDGE_CHAT_ID`). Channel IDs are negative integers of the form `-100xxxxxxxxxx`. Pick one method:
+   - Post any message in the channel, then call `https://api.telegram.org/bot<BOT_A_TOKEN>/getUpdates` from a browser or `curl`. Look for `channel_post.chat.id`. If the field is missing, ensure the bot was added as admin *before* the post and that no other long-poller is consuming updates.
+   - Or forward a channel message to [@userinfobot](https://t.me/userinfobot) / [@RawDataBot](https://t.me/RawDataBot) and copy the reported chat id.
+
+4. Fill `.env` (copy from `.env.example`):
+   ```
+   BOT_A_TOKEN=<token from step 1, bot A>
+   BOT_B_TOKEN=<token from step 1, bot B>
+   BRIDGE_CHAT_ID=-100xxxxxxxxxx
+   ```
+   The same `.env` shape is used on both the client machine and the server machine; only `BOT_A_TOKEN` is read by `client`, only `BOT_B_TOKEN` by `server`, and both read `BRIDGE_CHAT_ID`.
+
+5. Sanity-check by starting `python -m server.main` and `python -m client.main` on their respective hosts and watching the logs for the first request to round-trip through the channel.
+
+`clear_channel.py` in the repo root can wipe accumulated frames from the channel between sessions; it uses `BOT_A_TOKEN` (or `BOT_B_TOKEN`) and `BRIDGE_CHAT_ID` from the same `.env`.
+
 ## Architecture
 
 There are three optional runtime processes:
