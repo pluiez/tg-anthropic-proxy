@@ -102,27 +102,43 @@ Benchmark notes:
 
 ## Development
 
-Install dependencies:
+This project uses [uv](https://docs.astral.sh/uv/) for dependency and virtualenv management. The committed `uv.lock` pins the resolved versions.
+
+Install dependencies (creates `.venv/` and syncs from `uv.lock`):
 
 ```bash
-python -m pip install -e .
+uv sync
 ```
 
 Run the client:
 
 ```bash
-python -m client.main
+uv run python -m client.main
 ```
 
 Run the server:
 
 ```bash
-python -m server.main
+uv run python -m server.main
+```
+
+The server accepts one optional flag:
+
+- `--use-cc-proxy`: forward upstream Anthropic requests through the local `cc_proxy` sidecar instead of calling `ANTHROPIC_BASE_URL` directly. The server health-checks the sidecar at startup and exits with a clear error if it is not running.
+
+```bash
+uv run python -m server.main --use-cc-proxy
+```
+
+Run the optional `cc_proxy` sidecar (required when the server is started with `--use-cc-proxy`):
+
+```bash
+uv run python -m cc_proxy.main
 ```
 
 Run checks:
 
 ```bash
-python -m compileall client server shared cc_proxy
-python -m pytest
+uv run python -m compileall client server shared cc_proxy
+uv run python -m pytest
 ```
