@@ -113,7 +113,10 @@ async def _ensure_cc_proxy_healthy(base_url: str) -> None:
     health_url = f"{base_url.rstrip('/')}/health"
     log.info("server checking cc_proxy health url=%s", health_url)
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(5.0, connect=2.0),
+            trust_env=False,
+        ) as client:
             response = await client.get(health_url)
             response.raise_for_status()
             data = response.json()
@@ -626,6 +629,7 @@ async def serve(*, use_cc_proxy: bool = False) -> None:
     _http = httpx.AsyncClient(
         timeout=httpx.Timeout(600.0, connect=10.0),
         http2=True,
+        trust_env=not use_cc_proxy,
     )
 
     _app = (
