@@ -20,6 +20,12 @@ _REQUEST_DROP_HEADERS = _HOP_BY_HOP_HEADERS | {
     "x-tg-proxy-rid",
 }
 
+_PASSTHROUGH_DROP_HEADERS = _HOP_BY_HOP_HEADERS | {
+    "content-length",
+    "host",
+    "x-tg-proxy-rid",
+}
+
 _FORCED_HEADERS = {
     "accept-encoding",
     "user-agent",
@@ -75,3 +81,12 @@ def build_claude_code_headers(
     outbound["x-app"] = "cli"
     outbound["accept-encoding"] = "identity"
     return outbound
+
+
+def build_passthrough_headers(incoming: Mapping[str, str]) -> dict[str, str]:
+    """Return upstream request headers without Claude Code fingerprinting."""
+    return {
+        name.lower(): value
+        for name, value in incoming.items()
+        if name.lower() not in _PASSTHROUGH_DROP_HEADERS
+    }

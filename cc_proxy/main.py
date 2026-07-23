@@ -1,3 +1,4 @@
+import argparse
 import logging
 import os
 import time
@@ -13,7 +14,7 @@ import uvicorn  # noqa: E402
 from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse  # noqa: E402
 
-from cc_proxy.headers import build_claude_code_headers  # noqa: E402
+from cc_proxy.headers import build_claude_code_headers, build_passthrough_headers  # noqa: E402
 from shared.logging_utils import redact_headers, summarize_json_body  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -107,6 +108,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.state.claude_code_headers_enabled = True
 
 
 @app.get("/health")
@@ -135,13 +137,19 @@ async def proxy(path: str, request: Request):
     body = await request.body()
     upstream_url = _join_upstream_url(request.app.state.upstream_base_url, request)
     incoming_headers = redact_headers(request.headers)
-    headers = build_claude_code_headers(request.headers)
+    claude_code_headers_enabled = getattr(request.app.state, "claude_code_headers_enabled", True)
+    header_mode = "claude-code" if claude_code_headers_enabled else "passthrough"
+    if claude_code_headers_enabled:
+        headers = build_claude_code_headers(request.headers)
+    else:
+        headers = build_passthrough_headers(request.headers)
     log.info(
-        "[%s] cc_proxy accepted request method=%s path=%s upstream=%s body=%s incoming_headers=%s",
+        "[%s] cc_proxy accepted request method=%s path=%s upstream=%s header_mode=%s body=%s incoming_headers=%s",
         rid,
         request.method,
         request.url.path,
         upstream_url,
+        header_mode,
         summarize_json_body(body),
         incoming_headers,
     )
@@ -214,7 +222,19 @@ async def proxy(path: str, request: Request):
     )
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the optional Anthropic cc_proxy sidecar.")
+    parser.add_argument(
+        "--no-claude-code-headers",
+        action="store_true",
+        help="forward request headers as-is except proxy/internal hop-by-hop headers",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = _parse_args()
+    app.state.claude_code_headers_enabled = not args.no_claude_code_headers
     uvicorn.run(
         app,
         host=os.getenv("CC_PROXY_HOST", "127.0.0.1"),

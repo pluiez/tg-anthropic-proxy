@@ -67,6 +67,13 @@ Run the sidecar manually:
 python -m cc_proxy.main
 ```
 
+To make `cc_proxy` act as a plain forwarding proxy without Claude Code header
+fingerprinting:
+
+```bash
+python -m cc_proxy.main --no-claude-code-headers
+```
+
 Then start the server with:
 
 ```bash
